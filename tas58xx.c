@@ -1634,7 +1634,7 @@ static const struct snd_kcontrol_new tas58xx_snd_controls_tas5825m_status[] = {
 	{
 		.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
 		.name = "PVDD Voltage mV",
-		.access = SNDRV_CTL_ELEM_ACCESS_READ,
+		.access = SNDRV_CTL_ELEM_ACCESS_READ | SNDRV_CTL_ELEM_ACCESS_VOLATILE,
 		.info = tas58xx_pvdd_info,
 		.get = tas58xx_pvdd_get,
 	},
