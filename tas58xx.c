@@ -1480,6 +1480,9 @@ static const struct tas58xx_profile_coeff_ctrl ppc3_thd_fine_volume = { 205, 2 }
 static const struct tas58xx_profile_coeff_ctrl ppc3_output_crossbar = { 293, 8 };
 static const struct tas58xx_profile_coeff_ctrl ppc3_digital_gain = { 301, 2 };
 static const struct tas58xx_profile_coeff_ctrl ppc3_input_mixer = { 303, 4 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_dc_block_bypass = { 307, 1 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_gang_eq = { 308, 1 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_eq_bypass = { 309, 1 };
 static const struct tas58xx_profile_coeff_ctrl ppc3_level_meter_config = { 310, 2 };
 static const struct tas58xx_profile_coeff_ctrl ppc3_agl_soft_alpha = { 316, 1 };
 static const struct tas58xx_profile_coeff_ctrl ppc3_agl_attack = { 317, 1 };
@@ -1550,6 +1553,9 @@ static const struct snd_kcontrol_new tas58xx_snd_controls_drc3agl[] = {
 	TAS58XX_PROFILE_COEFF_CTRL("PPC3 Output Crossbar Coefficients", ppc3_output_crossbar),
 	TAS58XX_PROFILE_COEFF_CTRL("PPC3 Digital Gain Coefficients", ppc3_digital_gain),
 	TAS58XX_PROFILE_COEFF_CTRL("PPC3 Input Mixer Coefficients", ppc3_input_mixer),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 DC Block Bypass", ppc3_dc_block_bypass),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 Gang EQ", ppc3_gang_eq),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 Global EQ Bypass", ppc3_eq_bypass),
 	TAS58XX_PROFILE_COEFF_CTRL("PPC3 Level Meter Config Coefficients", ppc3_level_meter_config),
 	TAS58XX_PROFILE_COEFF_CTRL("PPC3 Dynamic EQ Core Coefficients", ppc3_deq_core),
 	TAS58XX_PROFILE_COEFF_CTRL("PPC3 PEQ Left 01 Coefficients", ppc3_peq_l01),
@@ -1591,6 +1597,47 @@ static const struct snd_kcontrol_new tas58xx_snd_controls_drc3agl[] = {
 	TAS58XX_PROFILE_COEFF_CTRL("PPC3 DRC Xover Mid LP Coefficients", ppc3_xover_mid_lp),
 	TAS58XX_PROFILE_METER_CTRL("PPC3 Level Meter Left Raw", ppc3_meter_left),
 	TAS58XX_PROFILE_METER_CTRL("PPC3 Level Meter Right Raw", ppc3_meter_right),
+};
+
+static int tas58xx_pvdd_info(struct snd_kcontrol *kcontrol,
+			    struct snd_ctl_elem_info *uinfo)
+{
+	uinfo->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
+	uinfo->count = 1;
+	uinfo->value.integer.min = 0;
+	uinfo->value.integer.max = 31000;
+	return 0;
+}
+
+static int tas58xx_pvdd_get(struct snd_kcontrol *kcontrol,
+			   struct snd_ctl_elem_value *ucontrol)
+{
+	struct snd_soc_component *component = snd_soc_kcontrol_component(kcontrol);
+	struct tas58xx_priv *tas58xx = snd_soc_component_get_drvdata(component);
+	unsigned int raw;
+	int ret;
+
+	mutex_lock(&tas58xx->lock);
+	SET_BOOK_AND_PAGE(tas58xx->regmap,
+			  TAS58XX_BOOK_CONTROL_PORT, TAS58XX_REG_PAGE_0);
+	ret = regmap_read(tas58xx->regmap, TAS5825M_REG_PVDD_ADC, &raw);
+	mutex_unlock(&tas58xx->lock);
+	if (ret)
+		return ret;
+
+	ucontrol->value.integer.value[0] =
+		DIV_ROUND_CLOSEST_ULL((u64)raw * 1000000ULL, 8428ULL);
+	return 0;
+}
+
+static const struct snd_kcontrol_new tas58xx_snd_controls_tas5825m_status[] = {
+	{
+		.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+		.name = "PVDD Voltage mV",
+		.access = SNDRV_CTL_ELEM_ACCESS_READ | SNDRV_CTL_ELEM_ACCESS_VOLATILE,
+		.info = tas58xx_pvdd_info,
+		.get = tas58xx_pvdd_get,
+	},
 };
 
 /* Base controls (always registered) */
@@ -2448,6 +2495,8 @@ static int tas58xx_i2c_probe(struct i2c_client *i2c)
 
 	/* Calculate total number of controls */
 	num_controls = ARRAY_SIZE(tas58xx_snd_controls_base);
+	if (tas58xx->variant == TAS5825M)
+		num_controls += ARRAY_SIZE(tas58xx_snd_controls_tas5825m_status);
 	if (tas58xx->fault_monitor)
 		num_controls += ARRAY_SIZE(tas58xx_snd_controls_faults);
 	if (tas58xx->dsp_profile_drc3agl)
@@ -2477,6 +2526,12 @@ static int tas58xx_i2c_probe(struct i2c_client *i2c)
 	/* Copy base controls */
 	memcpy(controls, tas58xx_snd_controls_base, sizeof(tas58xx_snd_controls_base));
 	int offset = ARRAY_SIZE(tas58xx_snd_controls_base);
+
+	if (tas58xx->variant == TAS5825M) {
+		memcpy(&controls[offset], tas58xx_snd_controls_tas5825m_status,
+		       sizeof(tas58xx_snd_controls_tas5825m_status));
+		offset += ARRAY_SIZE(tas58xx_snd_controls_tas5825m_status);
+	}
 
 	/* Add fault monitoring controls if enabled */
 	if (tas58xx->fault_monitor) {
