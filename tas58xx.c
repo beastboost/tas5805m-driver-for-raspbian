@@ -156,7 +156,7 @@ struct tas58xx_priv {
 	struct tas58xx_cfg_op	*dsp_cfg_ops;
 	int						dsp_cfg_num_ops;
 	bool					dsp_cfg_loaded;  /* True once a non-empty text DSP config was applied */
-	bool					dsp_profile_drc3agl; /* Exact TAS5825M PPC3 drc3agl flow */
+	bool					dsp_profile_drc3agl;
 
 	struct regmap			*regmap;
 	enum tas58xx_variant	variant;
@@ -1144,21 +1144,7 @@ static int tas58xx_mixer_mode_put(struct snd_kcontrol *kcontrol,
 	return ret;
 }
 
-/*
- * TAS5825M PurePath Console 3 "drc3agl" live coefficient controls.
- *
- * Registered only when the exact drc3agl DSP profile is loaded. Human-unit
- * conversion remains in userspace; ALSA exposes a narrow, profile-aware
- * signed 32-bit coefficient transport instead of an arbitrary register writer.
- *
- * Process Flow 3 Device-A coefficient map:
- *   coeff    0..1999 -> book 0x8c
- *   coeff 2000..3999 -> book 0xaa
- *   page = 1 + local / 30
- *   reg  = 0x08 + 4 * (local % 30)
- *
- * PEQ-L BQ1 B0 is coefficient 2010, therefore AA:01:30.
- */
+/* PPC3 drc3agl live coefficient controls. */
 #define TAS5825M_PPC3_BOOK0             0x8c
 #define TAS5825M_PPC3_BOOK1             0xaa
 #define TAS5825M_PPC3_COEFFS_PER_BANK   2000
@@ -1236,10 +1222,7 @@ static int tas5825m_ppc3_write_coeff(struct tas58xx_priv *tas58xx,
 	return regmap_bulk_write(tas58xx->regmap, reg, buf, sizeof(buf));
 }
 
-/*
- * Commit a complete five-coefficient PF3 biquad with no coefficient reads
- * interleaved once the write begins. The order is B0, B1, B2, A1, A2.
- */
+/* Write a complete B0/B1/B2/A1/A2 biquad. */
 static int tas5825m_ppc3_write_biquad(struct tas58xx_priv *tas58xx,
 				      unsigned int start_coeff,
 				      const s32 values[5])
@@ -1768,10 +1751,7 @@ static char *tas58xx_cfg_next_token(char **cursor)
 	return NULL;
 }
 
-/* PPC3 may print either a Linux-style 7-bit address (0x4c) or the
- * 8-bit I2C write address (0x98). Accept both forms. An 8-bit write
- * address always has bit 0 clear.
- */
+/* PPC3 exports may use 7-bit or 8-bit write addresses. */
 static bool tas58xx_cfg_addr_matches(unsigned int addr, u8 i2c_addr)
 {
 	if (addr == i2c_addr)
@@ -1780,10 +1760,6 @@ static bool tas58xx_cfg_addr_matches(unsigned int addr, u8 i2c_addr)
 	return addr <= 0xff && !(addr & 1) && (addr >> 1) == i2c_addr;
 }
 
-/* Parse one already-trimmed PPC3 line. If @ops is NULL, only count the
- * operations that the line would produce. This lets the caller allocate
- * exactly enough entries before the second parsing pass.
- */
 static void tas58xx_parse_config_line(struct device *dev, u8 i2c_addr,
 				      char *line, struct tas58xx_cfg_op *ops,
 				      size_t capacity, size_t *count,
@@ -1874,20 +1850,7 @@ overflow:
 			 __func__, line);
 }
 
-/* Parse a PPC3 text register-dump export into a sequence of write/delay
- * operations. Write lines may contain a single value or a burst:
- *
- *   w <i2c_addr_hex> <reg_hex> <val0_hex> [val1_hex ...]
- *   d <delay_ms>
- *
- * PPC3 commonly emits the 8-bit I2C write address (for example 0x98 for
- * Linux address 0x4c). Both forms are accepted. Burst data is expanded
- * into sequential register writes, preserving the existing cfg-op format.
- *
- * Optional trailing "# comment" text and blank/comment-only lines are
- * ignored. A single export may contain configuration for several DACs;
- * write lines whose address does not match this device are dropped.
- */
+/* Parse PPC3 text config and expand burst writes. */
 static int tas58xx_parse_text_config(struct device *dev, u8 i2c_addr,
 				      const char *text, size_t text_len,
 				      struct tas58xx_cfg_op **out_ops,
