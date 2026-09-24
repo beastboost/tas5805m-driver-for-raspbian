@@ -1413,10 +1413,16 @@ struct tas58xx_meter_ctrl {
 static int tas58xx_meter_info(struct snd_kcontrol *kcontrol,
 			      struct snd_ctl_elem_info *uinfo)
 {
-	uinfo->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
+	/*
+	 * The DSP meter is a raw unsigned 32-bit word. ALSA INTEGER uses
+	 * signed long, which cannot represent 0xffffffff on 32-bit kernels.
+	 * INTEGER64 keeps the userspace ABI identical across 32- and 64-bit
+	 * architectures while preserving the complete raw meter value.
+	 */
+	uinfo->type = SNDRV_CTL_ELEM_TYPE_INTEGER64;
 	uinfo->count = 1;
-	uinfo->value.integer.min = 0;
-	uinfo->value.integer.max = 0xffffffffUL;
+	uinfo->value.integer64.min = 0;
+	uinfo->value.integer64.max = 0xffffffffULL;
 	return 0;
 }
 
@@ -1442,7 +1448,7 @@ static int tas58xx_meter_get(struct snd_kcontrol *kcontrol,
 	if (!ret) {
 		raw = ((u32)buf[0] << 24) | ((u32)buf[1] << 16) |
 		      ((u32)buf[2] << 8) | (u32)buf[3];
-		ucontrol->value.integer.value[0] = (unsigned long)raw;
+		ucontrol->value.integer64.value[0] = (long long)raw;
 	}
 
 	SET_BOOK_AND_PAGE(tas58xx->regmap,
