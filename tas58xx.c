@@ -29,6 +29,7 @@
 #include <linux/regulator/consumer.h>
 #include <linux/atomic.h>
 #include <linux/workqueue.h>
+#include <linux/spinlock.h>
 
 #include <sound/soc.h>
 #include <sound/pcm.h>
@@ -156,6 +157,7 @@ struct tas58xx_priv {
 	struct tas58xx_cfg_op	*dsp_cfg_ops;
 	int						dsp_cfg_num_ops;
 	bool					dsp_cfg_loaded;  /* True once a non-empty text DSP config was applied */
+	bool					dsp_profile_drc3agl;
 
 	struct regmap			*regmap;
 	enum tas58xx_variant	variant;
@@ -189,7 +191,7 @@ struct tas58xx_priv {
 
 /* Global list of all TAS58XX devices and lock */
 static LIST_HEAD(tas58xx_device_list);
-static DEFINE_MUTEX(tas58xx_list_mutex);
+static DEFINE_SPINLOCK(tas58xx_list_lock);
 
 static void tas58xx_decode_faults(struct device *dev, unsigned int chan,
 				   unsigned int global1, unsigned int global2,
@@ -1143,6 +1145,538 @@ static int tas58xx_mixer_mode_put(struct snd_kcontrol *kcontrol,
 	return ret;
 }
 
+/* PPC3 drc3agl live coefficient controls. */
+#define TAS5825M_PPC3_BOOK0             0x8c
+#define TAS5825M_PPC3_BOOK1             0xaa
+#define TAS5825M_PPC3_COEFFS_PER_BANK   2000
+#define TAS5825M_PPC3_COEFFS_PER_PAGE   30
+#define TAS5825M_PPC3_FIRST_PAGE        1
+#define TAS5825M_PPC3_FIRST_REG         0x08
+
+struct tas58xx_profile_coeff_ctrl {
+	unsigned int start_coeff;
+	unsigned int count;
+};
+
+static int tas58xx_select_page(struct regmap *rm, unsigned int book,
+			       unsigned int page)
+{
+	int ret;
+
+	ret = regmap_write(rm, TAS58XX_REG_PAGE_SET, TAS58XX_REG_PAGE_0);
+	if (ret)
+		return ret;
+	ret = regmap_write(rm, TAS58XX_REG_BOOK_SET, book);
+	if (ret)
+		return ret;
+	return regmap_write(rm, TAS58XX_REG_PAGE_SET, page);
+}
+
+static int tas58xx_select_page0(struct tas58xx_priv *tas58xx, int ret)
+{
+	int rret = tas58xx_select_page(tas58xx->regmap,
+				       TAS58XX_BOOK_CONTROL_PORT,
+				       TAS58XX_REG_PAGE_0);
+
+	return ret ? ret : rret;
+}
+
+static int tas5825m_ppc3_coeff_addr(unsigned int coeff, u8 *book,
+				    u8 *page, u8 *reg)
+{
+	unsigned int local;
+
+	if (coeff >= 4000)
+		return -EINVAL;
+
+	if (coeff >= TAS5825M_PPC3_COEFFS_PER_BANK) {
+		*book = TAS5825M_PPC3_BOOK1;
+		local = coeff - TAS5825M_PPC3_COEFFS_PER_BANK;
+	} else {
+		*book = TAS5825M_PPC3_BOOK0;
+		local = coeff;
+	}
+
+	*page = TAS5825M_PPC3_FIRST_PAGE +
+		(local / TAS5825M_PPC3_COEFFS_PER_PAGE);
+	*reg = TAS5825M_PPC3_FIRST_REG +
+		4 * (local % TAS5825M_PPC3_COEFFS_PER_PAGE);
+	return 0;
+}
+
+static int tas5825m_ppc3_read_coeff(struct tas58xx_priv *tas58xx,
+				    unsigned int coeff, s32 *value)
+{
+	u8 book, page, reg, buf[4];
+	u32 raw;
+	int ret;
+
+	ret = tas5825m_ppc3_coeff_addr(coeff, &book, &page, &reg);
+	if (ret)
+		return ret;
+
+	ret = tas58xx_select_page(tas58xx->regmap, book, page);
+	if (ret)
+		return ret;
+	ret = regmap_bulk_read(tas58xx->regmap, reg, buf, sizeof(buf));
+	if (ret)
+		return ret;
+
+	raw = ((u32)buf[0] << 24) | ((u32)buf[1] << 16) |
+	      ((u32)buf[2] << 8) | (u32)buf[3];
+	*value = (s32)raw;
+	return 0;
+}
+
+static int tas5825m_ppc3_write_coeff(struct tas58xx_priv *tas58xx,
+				     unsigned int coeff, s32 value)
+{
+	u8 book, page, reg, buf[4];
+	u32 raw = (u32)value;
+	int ret;
+
+	ret = tas5825m_ppc3_coeff_addr(coeff, &book, &page, &reg);
+	if (ret)
+		return ret;
+
+	buf[0] = (raw >> 24) & 0xff;
+	buf[1] = (raw >> 16) & 0xff;
+	buf[2] = (raw >> 8) & 0xff;
+	buf[3] = raw & 0xff;
+
+	ret = tas58xx_select_page(tas58xx->regmap, book, page);
+	if (ret)
+		return ret;
+	return regmap_bulk_write(tas58xx->regmap, reg, buf, sizeof(buf));
+}
+
+/* Write a complete B0/B1/B2/A1/A2 biquad. */
+static int tas5825m_ppc3_write_biquad(struct tas58xx_priv *tas58xx,
+				      unsigned int start_coeff,
+				      const s32 values[5])
+{
+	unsigned int i = 0;
+	int ret;
+
+	while (i < 5) {
+		u8 book, page, reg, nbook = 0, npage = 0, nreg = 0;
+		u8 buf[20];
+		unsigned int n = 0;
+
+		ret = tas5825m_ppc3_coeff_addr(start_coeff + i,
+					       &book, &page, &reg);
+		if (ret)
+			return ret;
+		if (book != TAS5825M_PPC3_BOOK1)
+			return -EINVAL;
+
+		do {
+			u32 raw = (u32)values[i + n];
+
+			buf[4 * n] = (raw >> 24) & 0xff;
+			buf[4 * n + 1] = (raw >> 16) & 0xff;
+			buf[4 * n + 2] = (raw >> 8) & 0xff;
+			buf[4 * n + 3] = raw & 0xff;
+			n++;
+			if (i + n >= 5)
+				break;
+			ret = tas5825m_ppc3_coeff_addr(start_coeff + i + n,
+						       &nbook, &npage, &nreg);
+			if (ret)
+				return ret;
+		} while (nbook == book && npage == page && nreg == reg + 4 * n);
+
+		ret = tas58xx_select_page(tas58xx->regmap, book, page);
+		if (ret)
+			return ret;
+		ret = regmap_bulk_write(tas58xx->regmap, reg, buf, 4 * n);
+		if (ret)
+			return ret;
+		i += n;
+	}
+
+	return 0;
+}
+
+static int tas58xx_profile_coeff_info(struct snd_kcontrol *kcontrol,
+				      struct snd_ctl_elem_info *uinfo)
+{
+	const struct tas58xx_profile_coeff_ctrl *ctrl =
+		(const struct tas58xx_profile_coeff_ctrl *)kcontrol->private_value;
+
+	uinfo->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
+	uinfo->count = ctrl->count;
+	uinfo->value.integer.min = -2147483647L - 1;
+	uinfo->value.integer.max = 2147483647L;
+	return 0;
+}
+
+static int tas58xx_profile_coeff_get(struct snd_kcontrol *kcontrol,
+				     struct snd_ctl_elem_value *ucontrol)
+{
+	struct snd_soc_component *component = snd_soc_kcontrol_component(kcontrol);
+	struct tas58xx_priv *tas58xx = snd_soc_component_get_drvdata(component);
+	const struct tas58xx_profile_coeff_ctrl *ctrl =
+		(const struct tas58xx_profile_coeff_ctrl *)kcontrol->private_value;
+	unsigned int i;
+	int ret = 0;
+
+	mutex_lock(&tas58xx->lock);
+	if (!tas58xx->dsp_profile_drc3agl) {
+		ret = -EACCES;
+		goto out;
+	}
+	if (!tas58xx->dsp_initialized) {
+		ret = -EAGAIN;
+		goto out;
+	}
+
+	for (i = 0; i < ctrl->count; i++) {
+		s32 value;
+
+		ret = tas5825m_ppc3_read_coeff(tas58xx,
+					       ctrl->start_coeff + i, &value);
+		if (ret)
+			goto restore;
+		ucontrol->value.integer.value[i] = value;
+	}
+
+restore:
+	ret = tas58xx_select_page0(tas58xx, ret);
+out:
+	mutex_unlock(&tas58xx->lock);
+	return ret;
+}
+
+static int tas58xx_profile_coeff_put(struct snd_kcontrol *kcontrol,
+				     struct snd_ctl_elem_value *ucontrol)
+{
+	struct snd_soc_component *component = snd_soc_kcontrol_component(kcontrol);
+	struct tas58xx_priv *tas58xx = snd_soc_component_get_drvdata(component);
+	const struct tas58xx_profile_coeff_ctrl *ctrl =
+		(const struct tas58xx_profile_coeff_ctrl *)kcontrol->private_value;
+	unsigned int i;
+	int ret = 0;
+	bool changed = false;
+
+	mutex_lock(&tas58xx->lock);
+	if (!tas58xx->dsp_profile_drc3agl) {
+		ret = -EACCES;
+		goto out;
+	}
+	if (!tas58xx->dsp_initialized) {
+		ret = -EAGAIN;
+		goto out;
+	}
+
+	if (ctrl->count == 5 && ctrl->start_coeff >= 2000) {
+		s32 old_values[5];
+		s32 new_values[5];
+
+		for (i = 0; i < 5; i++) {
+			long requested = ucontrol->value.integer.value[i];
+
+			if (requested < (-2147483647L - 1) ||
+			    requested > 2147483647L) {
+				ret = -EINVAL;
+				goto restore;
+			}
+			new_values[i] = (s32)requested;
+			ret = tas5825m_ppc3_read_coeff(tas58xx,
+						       ctrl->start_coeff + i,
+						       &old_values[i]);
+			if (ret)
+				goto restore;
+			if (old_values[i] != new_values[i])
+				changed = true;
+		}
+
+		if (changed) {
+			ret = tas5825m_ppc3_write_biquad(tas58xx,
+						     ctrl->start_coeff,
+						     new_values);
+			if (ret)
+				goto restore;
+		}
+		goto restore;
+	}
+
+	for (i = 0; i < ctrl->count; i++) {
+		long requested = ucontrol->value.integer.value[i];
+		s32 old_value = 0;
+		s32 new_value;
+
+		if (requested < (-2147483647L - 1) ||
+		    requested > 2147483647L) {
+			ret = -EINVAL;
+			goto restore;
+		}
+		new_value = (s32)requested;
+
+		ret = tas5825m_ppc3_read_coeff(tas58xx,
+					       ctrl->start_coeff + i, &old_value);
+		if (ret)
+			goto restore;
+		if (old_value == new_value)
+			continue;
+
+		ret = tas5825m_ppc3_write_coeff(tas58xx,
+						ctrl->start_coeff + i, new_value);
+		if (ret)
+			goto restore;
+		changed = true;
+	}
+
+restore:
+	ret = tas58xx_select_page0(tas58xx, ret);
+out:
+	mutex_unlock(&tas58xx->lock);
+	if (ret)
+		return ret;
+	return changed ? 1 : 0;
+}
+
+struct tas58xx_meter_ctrl {
+	u8 reg;
+};
+
+static int tas58xx_meter_info(struct snd_kcontrol *kcontrol,
+			      struct snd_ctl_elem_info *uinfo)
+{
+	/*
+	 * The DSP meter is a raw unsigned 32-bit word. ALSA INTEGER uses
+	 * signed long, which cannot represent 0xffffffff on 32-bit kernels.
+	 * INTEGER64 keeps the userspace ABI identical across 32- and 64-bit
+	 * architectures while preserving the complete raw meter value.
+	 */
+	uinfo->type = SNDRV_CTL_ELEM_TYPE_INTEGER64;
+	uinfo->count = 1;
+	uinfo->value.integer64.min = 0;
+	uinfo->value.integer64.max = 0xffffffffULL;
+	return 0;
+}
+
+static int tas58xx_meter_get(struct snd_kcontrol *kcontrol,
+			     struct snd_ctl_elem_value *ucontrol)
+{
+	struct snd_soc_component *component = snd_soc_kcontrol_component(kcontrol);
+	struct tas58xx_priv *tas58xx = snd_soc_component_get_drvdata(component);
+	const struct tas58xx_meter_ctrl *ctrl =
+		(const struct tas58xx_meter_ctrl *)kcontrol->private_value;
+	u8 buf[4];
+	u32 raw;
+	int ret;
+
+	mutex_lock(&tas58xx->lock);
+	if (!tas58xx->dsp_profile_drc3agl || !tas58xx->dsp_initialized) {
+		ret = tas58xx->dsp_initialized ? -EACCES : -EAGAIN;
+		goto out;
+	}
+
+	ret = tas58xx_select_page(tas58xx->regmap, 0x78, 0x01);
+	if (!ret)
+		ret = regmap_bulk_read(tas58xx->regmap, ctrl->reg, buf, sizeof(buf));
+	if (!ret) {
+		raw = ((u32)buf[0] << 24) | ((u32)buf[1] << 16) |
+		      ((u32)buf[2] << 8) | (u32)buf[3];
+		ucontrol->value.integer64.value[0] = (long long)raw;
+	}
+
+	ret = tas58xx_select_page0(tas58xx, ret);
+out:
+	mutex_unlock(&tas58xx->lock);
+	return ret;
+}
+
+#define TAS58XX_PROFILE_COEFF_CTRL(xname, xctrl) \
+{ \
+	.iface = SNDRV_CTL_ELEM_IFACE_MIXER, \
+	.name = xname, \
+	.access = SNDRV_CTL_ELEM_ACCESS_READWRITE, \
+	.info = tas58xx_profile_coeff_info, \
+	.get = tas58xx_profile_coeff_get, \
+	.put = tas58xx_profile_coeff_put, \
+	.private_value = (unsigned long)&xctrl, \
+}
+
+#define TAS58XX_PROFILE_METER_CTRL(xname, xctrl) \
+{ \
+	.iface = SNDRV_CTL_ELEM_IFACE_MIXER, \
+	.name = xname, \
+	.access = SNDRV_CTL_ELEM_ACCESS_READ, \
+	.info = tas58xx_meter_info, \
+	.get = tas58xx_meter_get, \
+	.private_value = (unsigned long)&xctrl, \
+}
+
+static const struct tas58xx_profile_coeff_ctrl ppc3_agl_enable = { 8, 1 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_volume_alpha = { 9, 1 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_thd_clipper = { 203, 1 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_thd_fine_volume = { 205, 2 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_output_crossbar = { 293, 8 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_digital_gain = { 301, 2 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_input_mixer = { 303, 4 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_dc_block_bypass = { 307, 1 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_gang_eq = { 308, 1 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_eq_bypass = { 309, 1 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_level_meter_config = { 310, 2 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_agl_soft_alpha = { 316, 1 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_agl_attack = { 317, 1 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_agl_soft_omega = { 319, 1 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_agl_release = { 320, 1 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_deq_core = { 411, 3 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_agl_threshold = { 429, 1 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_drc_low = { 453, 10 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_drc_mid = { 463, 10 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_drc_high = { 473, 10 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_drc_mixer = { 483, 3 };
+
+static const struct tas58xx_profile_coeff_ctrl ppc3_peq_l01 = { 2010, 5 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_peq_l02 = { 2015, 5 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_peq_l03 = { 2020, 5 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_peq_l04 = { 2025, 5 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_peq_l05 = { 2030, 5 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_peq_l06 = { 2035, 5 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_peq_l07 = { 2040, 5 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_peq_l08 = { 2045, 5 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_peq_l09 = { 2050, 5 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_peq_l10 = { 2055, 5 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_peq_l11 = { 2060, 5 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_peq_l12 = { 2065, 5 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_peq_l13 = { 2070, 5 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_peq_l14 = { 2075, 5 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_peq_l15 = { 2080, 5 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_peq_r01 = { 2085, 5 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_peq_r02 = { 2090, 5 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_peq_r03 = { 2095, 5 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_peq_r04 = { 2100, 5 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_peq_r05 = { 2105, 5 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_peq_r06 = { 2110, 5 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_peq_r07 = { 2115, 5 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_peq_r08 = { 2120, 5 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_peq_r09 = { 2125, 5 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_peq_r10 = { 2130, 5 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_peq_r11 = { 2135, 5 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_peq_r12 = { 2140, 5 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_peq_r13 = { 2145, 5 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_peq_r14 = { 2150, 5 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_peq_r15 = { 2155, 5 };
+
+static const struct tas58xx_profile_coeff_ctrl ppc3_deq_sense = { 2414, 5 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_deq_low = { 2419, 5 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_deq_high = { 2424, 5 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_xover_low_lp = { 2433, 5 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_xover_high_hp = { 2438, 5 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_xover_mid_hp = { 2443, 5 };
+static const struct tas58xx_profile_coeff_ctrl ppc3_xover_mid_lp = { 2448, 5 };
+static const struct tas58xx_meter_ctrl ppc3_meter_left = { 0x48 };
+static const struct tas58xx_meter_ctrl ppc3_meter_right = { 0x7c };
+
+static const struct snd_kcontrol_new tas58xx_snd_controls_drc3agl[] = {
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 AGL Enable Coefficient", ppc3_agl_enable),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 AGL Threshold Coefficient", ppc3_agl_threshold),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 AGL Soft Alpha Coefficient", ppc3_agl_soft_alpha),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 AGL Attack Coefficient", ppc3_agl_attack),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 AGL Soft Omega Coefficient", ppc3_agl_soft_omega),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 AGL Release Coefficient", ppc3_agl_release),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 DRC3 Low Coefficients", ppc3_drc_low),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 DRC3 Mid Coefficients", ppc3_drc_mid),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 DRC3 High Coefficients", ppc3_drc_high),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 DRC3 Mixer Coefficients", ppc3_drc_mixer),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 Volume Alpha Coefficient", ppc3_volume_alpha),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 THD Clipper Coefficient", ppc3_thd_clipper),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 THD Fine Volume Coefficients", ppc3_thd_fine_volume),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 Output Crossbar Coefficients", ppc3_output_crossbar),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 Digital Gain Coefficients", ppc3_digital_gain),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 Input Mixer Coefficients", ppc3_input_mixer),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 DC Block Bypass", ppc3_dc_block_bypass),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 Gang EQ", ppc3_gang_eq),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 Global EQ Bypass", ppc3_eq_bypass),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 Level Meter Config Coefficients", ppc3_level_meter_config),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 Dynamic EQ Core Coefficients", ppc3_deq_core),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 PEQ Left 01 Coefficients", ppc3_peq_l01),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 PEQ Left 02 Coefficients", ppc3_peq_l02),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 PEQ Left 03 Coefficients", ppc3_peq_l03),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 PEQ Left 04 Coefficients", ppc3_peq_l04),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 PEQ Left 05 Coefficients", ppc3_peq_l05),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 PEQ Left 06 Coefficients", ppc3_peq_l06),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 PEQ Left 07 Coefficients", ppc3_peq_l07),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 PEQ Left 08 Coefficients", ppc3_peq_l08),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 PEQ Left 09 Coefficients", ppc3_peq_l09),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 PEQ Left 10 Coefficients", ppc3_peq_l10),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 PEQ Left 11 Coefficients", ppc3_peq_l11),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 PEQ Left 12 Coefficients", ppc3_peq_l12),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 PEQ Left 13 Coefficients", ppc3_peq_l13),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 PEQ Left 14 Coefficients", ppc3_peq_l14),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 PEQ Left 15 Coefficients", ppc3_peq_l15),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 PEQ Right 01 Coefficients", ppc3_peq_r01),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 PEQ Right 02 Coefficients", ppc3_peq_r02),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 PEQ Right 03 Coefficients", ppc3_peq_r03),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 PEQ Right 04 Coefficients", ppc3_peq_r04),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 PEQ Right 05 Coefficients", ppc3_peq_r05),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 PEQ Right 06 Coefficients", ppc3_peq_r06),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 PEQ Right 07 Coefficients", ppc3_peq_r07),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 PEQ Right 08 Coefficients", ppc3_peq_r08),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 PEQ Right 09 Coefficients", ppc3_peq_r09),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 PEQ Right 10 Coefficients", ppc3_peq_r10),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 PEQ Right 11 Coefficients", ppc3_peq_r11),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 PEQ Right 12 Coefficients", ppc3_peq_r12),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 PEQ Right 13 Coefficients", ppc3_peq_r13),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 PEQ Right 14 Coefficients", ppc3_peq_r14),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 PEQ Right 15 Coefficients", ppc3_peq_r15),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 Dynamic EQ Sense Coefficients", ppc3_deq_sense),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 Dynamic EQ Low Coefficients", ppc3_deq_low),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 Dynamic EQ High Coefficients", ppc3_deq_high),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 DRC Xover Low LP Coefficients", ppc3_xover_low_lp),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 DRC Xover High HP Coefficients", ppc3_xover_high_hp),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 DRC Xover Mid HP Coefficients", ppc3_xover_mid_hp),
+	TAS58XX_PROFILE_COEFF_CTRL("PPC3 DRC Xover Mid LP Coefficients", ppc3_xover_mid_lp),
+	TAS58XX_PROFILE_METER_CTRL("PPC3 Level Meter Left Raw", ppc3_meter_left),
+	TAS58XX_PROFILE_METER_CTRL("PPC3 Level Meter Right Raw", ppc3_meter_right),
+};
+
+static int tas58xx_pvdd_info(struct snd_kcontrol *kcontrol,
+			    struct snd_ctl_elem_info *uinfo)
+{
+	uinfo->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
+	uinfo->count = 1;
+	uinfo->value.integer.min = 0;
+	uinfo->value.integer.max = 31000;
+	return 0;
+}
+
+static int tas58xx_pvdd_get(struct snd_kcontrol *kcontrol,
+			   struct snd_ctl_elem_value *ucontrol)
+{
+	struct snd_soc_component *component = snd_soc_kcontrol_component(kcontrol);
+	struct tas58xx_priv *tas58xx = snd_soc_component_get_drvdata(component);
+	unsigned int raw;
+	int ret;
+
+	mutex_lock(&tas58xx->lock);
+	ret = tas58xx_select_page(tas58xx->regmap,
+				  TAS58XX_BOOK_CONTROL_PORT, TAS58XX_REG_PAGE_0);
+	if (!ret)
+		ret = regmap_read(tas58xx->regmap, TAS5825M_REG_PVDD_ADC, &raw);
+	mutex_unlock(&tas58xx->lock);
+	if (ret)
+		return ret;
+
+	ucontrol->value.integer.value[0] =
+		DIV_ROUND_CLOSEST_ULL((u64)raw * 1000000ULL, 8428ULL);
+	return 0;
+}
+
+static const struct snd_kcontrol_new tas58xx_snd_controls_tas5825m_status[] = {
+	{
+		.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+		.name = "PVDD Voltage mV",
+		.access = SNDRV_CTL_ELEM_ACCESS_READ | SNDRV_CTL_ELEM_ACCESS_VOLATILE,
+		.info = tas58xx_pvdd_info,
+		.get = tas58xx_pvdd_get,
+	},
+};
+
 /* Base controls (always registered) */
 static const struct snd_kcontrol_new tas58xx_snd_controls_base[] = {
 	{
@@ -1289,16 +1823,128 @@ static void send_cfg_ops(struct regmap *rm,
 	}
 }
 
+/* Return the next non-empty whitespace-delimited token. */
+static char *tas58xx_cfg_next_token(char **cursor)
+{
+	char *token;
+
+	while ((token = strsep(cursor, " \t")) != NULL)
+		if (*token)
+			return token;
+
+	return NULL;
+}
+
+/* PPC3 exports may use 7-bit or 8-bit write addresses. */
+static bool tas58xx_cfg_addr_matches(unsigned int addr, u8 i2c_addr)
+{
+	if (addr == i2c_addr)
+		return true;
+
+	return addr <= 0xff && !(addr & 1) && (addr >> 1) == i2c_addr;
+}
+
+static void tas58xx_parse_config_line(struct device *dev, u8 i2c_addr,
+				      char *line, struct tas58xx_cfg_op *ops,
+				      size_t capacity, size_t *count,
+				      bool warn)
+{
+	char *cursor = line;
+	char *token;
+	unsigned int addr, reg, val, delay_ms;
+	size_t start_count = *count;
+	size_t data_index = 0;
+
+	token = tas58xx_cfg_next_token(&cursor);
+	if (!token)
+		return;
+
+	if ((token[0] == 'w' || token[0] == 'W') && !token[1]) {
+		token = tas58xx_cfg_next_token(&cursor);
+		if (!token || kstrtouint(token, 16, &addr))
+			goto malformed_write;
+
+		token = tas58xx_cfg_next_token(&cursor);
+		if (!token || kstrtouint(token, 16, &reg) || reg > 0xff)
+			goto malformed_write;
+
+		if (!tas58xx_cfg_addr_matches(addr, i2c_addr))
+			return;
+
+		while ((token = tas58xx_cfg_next_token(&cursor)) != NULL) {
+			if (kstrtouint(token, 16, &val) || val > 0xff ||
+			    reg + data_index > 0xff)
+				goto malformed_write;
+
+			if (ops) {
+				if (*count >= capacity)
+					goto overflow;
+				ops[*count].type = TAS58XX_CFG_OP_WRITE;
+				ops[*count].reg = reg + data_index;
+				ops[*count].val = val;
+			}
+			(*count)++;
+			data_index++;
+		}
+
+		if (!data_index)
+			goto malformed_write;
+		return;
+	}
+
+	if ((token[0] == 'd' || token[0] == 'D') && !token[1]) {
+		token = tas58xx_cfg_next_token(&cursor);
+		if (!token || kstrtouint(token, 10, &delay_ms) ||
+		    delay_ms > 0xffff)
+			goto malformed_delay;
+
+		if (ops) {
+			if (*count >= capacity)
+				goto overflow;
+			ops[*count].type = TAS58XX_CFG_OP_DELAY;
+			ops[*count].delay_ms = delay_ms;
+		}
+		(*count)++;
+		return;
+	}
+
+	if (warn)
+		dev_warn(dev, "%s: unrecognized line, skipping: %s\n",
+			 __func__, line);
+	return;
+
+malformed_write:
+	*count = start_count;
+	if (warn)
+		dev_warn(dev, "%s: malformed write line, skipping: %s\n",
+			 __func__, line);
+	return;
+
+malformed_delay:
+	*count = start_count;
+	if (warn)
+		dev_warn(dev, "%s: malformed delay line, skipping: %s\n",
+			 __func__, line);
+	return;
+
+overflow:
+	*count = start_count;
+	if (warn)
+		dev_warn(dev, "%s: parser capacity exceeded, skipping: %s\n",
+			 __func__, line);
+}
+
 /* Parse a PPC3 text register-dump export into a sequence of write/delay
  * operations. Each line is either:
- *   w <i2c_addr_hex> <reg_hex> <val_hex>  - a register write
- *   d <delay_ms>                          - a delay
+ *   w <i2c_addr_hex> <reg_hex> <val_hex> [val_hex ...] - register writes
+ *   d <delay_ms>                                      - a delay
  * with optional trailing "# comment" text and blank/comment-only lines
  * ignored. Since a single export may contain configuration for several
  * DACs sharing the file but sitting at different I2C addresses, write
  * lines whose address does not match `i2c_addr` are silently dropped.
+ * Multiple values on a write line are expanded into sequential writes.
  *
- * On success, *out_ops is allocated with devm_kzalloc() against `dev`
+ * On success, *out_ops is allocated with devm_kcalloc() against `dev`
  * and *out_num_ops holds the number of matching operations (which may
  * be zero if the file contains nothing for this device's address).
  */
@@ -1307,66 +1953,51 @@ static int tas58xx_parse_text_config(struct device *dev, u8 i2c_addr,
 				      struct tas58xx_cfg_op **out_ops,
 				      int *out_num_ops)
 {
-	struct tas58xx_cfg_op *ops;
+	struct tas58xx_cfg_op *ops = NULL;
 	char *buf, *p, *line;
-	size_t i, capacity = 1;
-	int count = 0;
+	size_t capacity = 0;
+	size_t count = 0;
+	int pass;
 
-	for (i = 0; i < text_len; i++)
-		if (text[i] == '\n')
-			capacity++;
+	for (pass = 0; pass < 2; pass++) {
+		buf = kmemdup_nul(text, text_len, GFP_KERNEL);
+		if (!buf)
+			return -ENOMEM;
 
-	buf = kmemdup_nul(text, text_len, GFP_KERNEL);
-	if (!buf)
-		return -ENOMEM;
-
-	ops = devm_kzalloc(dev, capacity * sizeof(*ops), GFP_KERNEL);
-	if (!ops) {
-		kfree(buf);
-		return -ENOMEM;
-	}
-
-	p = buf;
-	while ((line = strsep(&p, "\r\n")) != NULL) {
-		char *comment = strchr(line, '#');
-		unsigned int addr, reg, val, delay_ms;
-
-		if (comment)
-			*comment = '\0';
-		line = strim(line);
-		if (!*line)
-			continue;
-
-		if (line[0] == 'w' || line[0] == 'W') {
-			if (sscanf(line, "%*c %x %x %x", &addr, &reg, &val) != 3) {
-				dev_warn(dev, "%s: malformed write line, skipping: %s\n",
-					 __func__, line);
-				continue;
-			}
-			if (addr != i2c_addr)
-				continue;
-
-			ops[count].type = TAS58XX_CFG_OP_WRITE;
-			ops[count].reg = reg;
-			ops[count].val = val;
-			count++;
-		} else if (line[0] == 'd' || line[0] == 'D') {
-			if (sscanf(line, "%*c %u", &delay_ms) != 1) {
-				dev_warn(dev, "%s: malformed delay line, skipping: %s\n",
-					 __func__, line);
-				continue;
+		if (pass == 1) {
+			if (capacity > INT_MAX) {
+				kfree(buf);
+				return -E2BIG;
 			}
 
-			ops[count].type = TAS58XX_CFG_OP_DELAY;
-			ops[count].delay_ms = delay_ms;
-			count++;
-		} else {
-			dev_warn(dev, "%s: unrecognized line, skipping: %s\n",
-				 __func__, line);
+			ops = devm_kcalloc(dev, max_t(size_t, capacity, 1),
+					    sizeof(*ops), GFP_KERNEL);
+			if (!ops) {
+				kfree(buf);
+				return -ENOMEM;
+			}
+			count = 0;
 		}
-	}
 
-	kfree(buf);
+		p = buf;
+		while ((line = strsep(&p, "\r\n")) != NULL) {
+			char *comment = strchr(line, '#');
+
+			if (comment)
+				*comment = '\0';
+			line = strim(line);
+			if (!*line)
+				continue;
+
+			tas58xx_parse_config_line(dev, i2c_addr, line,
+						  pass ? ops : NULL,
+						  pass ? capacity : 0,
+						  pass ? &count : &capacity,
+						  pass == 1);
+		}
+
+		kfree(buf);
+	}
 
 	*out_ops = ops;
 	*out_num_ops = count;
@@ -1396,17 +2027,14 @@ static int tas58xx_trigger(struct snd_pcm_substream *substream, int cmd,
 		 * This ensures both primary and secondary codecs get initialized
 		 * when playback starts, since TRIGGER events only reach primary.
 		 */
-		mutex_lock(&tas58xx_list_mutex);
-		list_for_each_entry(priv, &tas58xx_device_list, list) {
-			mutex_lock(&priv->lock);
-			if (!priv->is_powered && !work_pending(&priv->work)) {
-				dev_dbg(&priv->i2c->dev, "%s: scheduling work for device at 0x%02x\n",
-					__func__, priv->i2c->addr);
+		{
+			unsigned long flags;
+
+			spin_lock_irqsave(&tas58xx_list_lock, flags);
+			list_for_each_entry(priv, &tas58xx_device_list, list)
 				schedule_work(&priv->work);
-			}
-			mutex_unlock(&priv->lock);
+			spin_unlock_irqrestore(&tas58xx_list_lock, flags);
 		}
-		mutex_unlock(&tas58xx_list_mutex);
 		break;
 
 	case SNDRV_PCM_TRIGGER_STOP:
@@ -1431,6 +2059,10 @@ static void do_work(struct work_struct *work)
 		__func__);
 
 	mutex_lock(&tas58xx->lock);
+	if (tas58xx->is_powered) {
+		mutex_unlock(&tas58xx->lock);
+		return;
+	}
 	/* We mustn't issue any I2C transactions until the I2S
 	 * clock is stable. Furthermore, we must allow a 5ms
 	 * delay after the first set of register writes to
@@ -1670,6 +2302,8 @@ static int tas58xx_i2c_probe(struct i2c_client *i2c)
 
 		if (tas58xx->dsp_cfg_num_ops > 0) {
 			tas58xx->dsp_cfg_loaded = true;
+			tas58xx->dsp_profile_drc3agl =
+				(tas58xx->variant == TAS5825M && !strcmp(config_name, "drc3agl"));
 			dev_info(dev, "%s: loaded %d DSP config operations for I2C address 0x%02x from %s\n",
 				 __func__, tas58xx->dsp_cfg_num_ops, i2c->addr, filename);
 		} else {
@@ -1859,11 +2493,6 @@ static int tas58xx_i2c_probe(struct i2c_client *i2c)
 
 	INIT_WORK(&tas58xx->work, do_work);
 	mutex_init(&tas58xx->lock);
-	
-	/* Add to device list for trigger synchronization */
-	mutex_lock(&tas58xx_list_mutex);
-	list_add_tail(&tas58xx->list, &tas58xx_device_list);
-	mutex_unlock(&tas58xx_list_mutex);
 
 	/* Build component driver dynamically based on EQ mode */
 	struct snd_soc_component_driver *soc_codec_dev;
@@ -1912,8 +2541,12 @@ static int tas58xx_i2c_probe(struct i2c_client *i2c)
 
 	/* Calculate total number of controls */
 	num_controls = ARRAY_SIZE(tas58xx_snd_controls_base);
+	if (tas58xx->variant == TAS5825M)
+		num_controls += ARRAY_SIZE(tas58xx_snd_controls_tas5825m_status);
 	if (tas58xx->fault_monitor)
 		num_controls += ARRAY_SIZE(tas58xx_snd_controls_faults);
+	if (tas58xx->dsp_profile_drc3agl)
+		num_controls += ARRAY_SIZE(tas58xx_snd_controls_drc3agl);
 	if (expose_eq_mixer_controls) {
 		if (tas58xx->eq_mode_type != TAS58XX_EQ_MODE_OFF)
 			num_controls += ARRAY_SIZE(tas58xx_snd_controls_eq_toggle);
@@ -1940,10 +2573,22 @@ static int tas58xx_i2c_probe(struct i2c_client *i2c)
 	memcpy(controls, tas58xx_snd_controls_base, sizeof(tas58xx_snd_controls_base));
 	int offset = ARRAY_SIZE(tas58xx_snd_controls_base);
 
+	if (tas58xx->variant == TAS5825M) {
+		memcpy(&controls[offset], tas58xx_snd_controls_tas5825m_status,
+		       sizeof(tas58xx_snd_controls_tas5825m_status));
+		offset += ARRAY_SIZE(tas58xx_snd_controls_tas5825m_status);
+	}
+
 	/* Add fault monitoring controls if enabled */
 	if (tas58xx->fault_monitor) {
 		memcpy(&controls[offset], tas58xx_snd_controls_faults, sizeof(tas58xx_snd_controls_faults));
 		offset += ARRAY_SIZE(tas58xx_snd_controls_faults);
+	}
+
+	if (tas58xx->dsp_profile_drc3agl) {
+		memcpy(&controls[offset], tas58xx_snd_controls_drc3agl,
+		       sizeof(tas58xx_snd_controls_drc3agl));
+		offset += ARRAY_SIZE(tas58xx_snd_controls_drc3agl);
 	}
 
 	if (expose_eq_mixer_controls) {
@@ -1975,7 +2620,10 @@ static int tas58xx_i2c_probe(struct i2c_client *i2c)
 	}
 
 	/* Log control registration */
-	if (tas58xx->dsp_cfg_loaded)
+	if (tas58xx->dsp_profile_drc3agl)
+		dev_info(dev, "%s: Registered %d controls (PPC3 drc3agl live controls enabled; native EQ/mixer/channel controls hidden)\n",
+			 __func__, num_controls);
+	else if (tas58xx->dsp_cfg_loaded)
 		dev_info(dev, "%s: Registered %d controls (EQ/mixer/channel volume controls hidden: DSP config loaded)\n",
 			 __func__, num_controls);
 	else if (tas58xx->mixer_mode_from_dt && eq_controls)
@@ -2012,6 +2660,14 @@ static int tas58xx_i2c_probe(struct i2c_client *i2c)
 		return ret;
 	}
 
+	/* Add to device list for trigger synchronization */
+	{
+		unsigned long flags;
+
+		spin_lock_irqsave(&tas58xx_list_lock, flags);
+		list_add_tail(&tas58xx->list, &tas58xx_device_list);
+		spin_unlock_irqrestore(&tas58xx_list_lock, flags);
+	}
 	return 0;
 }
 
@@ -2024,9 +2680,13 @@ static void tas58xx_i2c_remove(struct i2c_client *i2c)
 		__func__, dev_name(dev));
 
 	/* Remove from device list */
-	mutex_lock(&tas58xx_list_mutex);
-	list_del(&tas58xx->list);
-	mutex_unlock(&tas58xx_list_mutex);
+	{
+		unsigned long flags;
+
+		spin_lock_irqsave(&tas58xx_list_lock, flags);
+		list_del(&tas58xx->list);
+		spin_unlock_irqrestore(&tas58xx_list_lock, flags);
+	}
 
 	cancel_work_sync(&tas58xx->work);
 	snd_soc_unregister_component(dev);
